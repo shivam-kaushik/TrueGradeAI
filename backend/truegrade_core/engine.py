@@ -228,6 +228,105 @@ Return VALID JSON ONLY as a list:
 
         return scaled
 
+    # ================== SINGLE ANSWER GRADING ======================
+    async def grade_single_answer(self, 
+                                  question_text: str, 
+                                  faculty_answer: str, 
+                                  max_marks: float,
+                                  student_answer: str,
+                                  allow_rag2: bool = True,
+                                  textbook_path: str = None) -> dict:
+        """
+        Grade a single student answer against a specific faculty answer.
+        """
+        if not student_answer.strip():
+             return {"score": 0.0, "deductions": [], "confidence": 0.0, "notes": {"error": "Empty answer"}}
+
+        # 1. Keypoints
+        # We need a stable key for caching. Use hash of faculty answer.
+        kp_key = hashlib.md5(faculty_answer.encode('utf-8')).hexdigest()
+        
+        if kp_key not in self.kp_cache:
+            self.kp_cache[kp_key] = {
+                "max_marks": max_marks,
+                "keypoints": self.extract_keypoints_once(faculty_answer, max_marks)
+            }
+            self.safe_json_save(self.keypoints_cache_path, self.kp_cache)
+                
+        keypoints = self.kp_cache[kp_key]["keypoints"]
+
+        # 2. Embeddings & Selection
+        kp_texts = [k["point"] for k in keypoints]
+        kp_embs = self.embed_texts(kp_texts)
+        s_emb = self.embed_texts([student_answer])[0]
+        f_ans_emb = self.embed_texts([faculty_answer])[0]
+        
+        # Sim checks
+        kp_sims = kp_embs @ s_emb
+        sim_rag1 = float(np.dot(s_emb, f_ans_emb))
+
+        selected_kps = []
+        for k, sim in zip(keypoints, kp_sims):
+            if k.get("core") or sim > self.kp_relevance_threshold:
+                selected_kps.append(k)
+        if not selected_kps: 
+            selected_kps = keypoints[:5]
+
+        # 3. Novelty & RAG2
+        nov = self.novelty_ratio(student_answer, faculty_answer)
+        rag2_used = False
+        rag2_evidence = {}
+        
+        if allow_rag2 and nov > self.novelty_trigger and textbook_path and os.path.exists(textbook_path):
+             # Basic lazy load check (in real app, use persistent index)
+             if not self.cold_index: # Abusing cold index slot for now or load separate
+                  pass # Placeholder for RAG2 specific logic in single mode
+        
+        # 4. LLM Eval
+        eval_res = self.llm_evaluate_keypoints_batch(
+            question_text,
+            selected_kps,
+            student_answer,
+            rag2_evidence
+        )
+
+        # 5. Score Calc
+        score = 0.0
+        deductions = []
+        kp_breakdown = []
+        
+        for res in eval_res:
+            awarded = float(res.get("awarded", 0))
+            score += awarded
+            kp_breakdown.append({
+                "id": res.get("id"),
+                "status": res.get("status"),
+                "awarded": awarded,
+                "weight": [k["weight"] for k in keypoints if k["id"] == res.get("id")][0] if [k for k in keypoints if k["id"] == res.get("id")] else 0,
+                "reason": res.get("reason")
+            })
+            
+            if awarded < 0.5:
+                 deductions.append({
+                     "lost": 0.5, # Simplified
+                     "reason": res.get("reason"), 
+                     "keyPoint": [k["point"] for k in keypoints if k["id"] == res.get("id")][0] if [k for k in keypoints if k["id"] == res.get("id")] else "Unknown"
+                 })
+        
+        score = min(score, max_marks)
+
+        return {
+            "score": score,
+            "maxMarks": max_marks,
+            "confidence": (sim_rag1 + 0.5) / 1.5, # Dummy calc
+            "usedRag2": rag2_used,
+            "novelty": nov,
+            "deductions": deductions,
+            "keyPointBreakdown": kp_breakdown,
+            "facultyMatch": {"similarity": sim_rag1},
+            "meta": {"rag2TopSim": 0.0}
+        }
+
     # ================== LLM EVALUATION ======================
     def llm_evaluate_keypoints_batch(self, question: str, keypoints: list, student_answer: str, rag2_evidence: dict):
         evid = {}
